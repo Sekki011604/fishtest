@@ -1,0 +1,16 @@
+fresh_caudal_fin
+fresh_eye
+fresh_pectoral_fin
+fresh_skin_texture
+less_fresh_caudal_fin
+less_fresh_eye
+less_fresh_pectoral_fin
+less_fresh_skin_texture
+spoiled_caudal_fin
+spoiled_eye
+spoiled_pectoral_fin
+spoiled_skin_texture
+very_fresh_caudal_fin
+very_fresh_eye
+very_fresh_pectoral_fin
+very_fresh_skin_texture

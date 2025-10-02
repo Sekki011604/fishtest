@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Fish Freshness</string>
+    <string name="about">About</string>
+    <string name="mackerel_title">Mackerel Scad Fish Freshness</string>
+    <string name="mackerel_subtitle">Real time fish freshness analysis</string>
+    <string name="scan">Scan</string>
+    <string name="scan_desc">Point your camera at the fish.</string>
+    <string name="analyze">Analyze</string>
+    <string name="analyze_desc">AI processes freshness indicators.</string>
+    <string name="result">Result</string>
+    <string name="result_desc">Get instant freshness rating and details.</string>
+    <string name="start_scanning">Start Scanning / Upload Image</string>
+</resources>
+
+
