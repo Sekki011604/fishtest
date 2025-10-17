@@ -63,17 +63,13 @@ class CamActivity : AppCompatActivity() {
                         val dispRect = computeImageViewDisplayRect(imgUploaded, bitmap)
                         reqExecutor.execute {
                             val (boxes, labelsOut) = detectWithBothModels(bitmap)
+                            Log.d(TAG, "Gallery detection - boxes: ${boxes.size}, labels: $labelsOut")
                             runOnUiThread {
                                 overlayView.setResults(boxes, labelsOut, bitmap.width, bitmap.height, dispRect)
+                                
                                 val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
-
-                                if (labelsOut.isNotEmpty()) {
-                                    tvPrediction.text = "Detected: ${labelsOut.joinToString(", ")}\nShelf-Life: $predictedShelfLife"
-                                    tvPrediction.setTextColor(Color.YELLOW) // shelf-life text in yellow
-                                } else {
-                                    tvPrediction.text = "No detection"
-                                    tvPrediction.setTextColor(Color.RED)
-                                }
+                                tvPrediction.text = "Shelf-life prediction: $predictedShelfLife"
+                                tvPrediction.setTextColor(Color.BLACK)
                             }
                         }
                     }
@@ -109,6 +105,9 @@ class CamActivity : AppCompatActivity() {
                 startCamera()
             }
         }
+
+        // Initialize shelf-life predictor (loads fish_model.tflite if present)
+        ShelfLifePredictor.init(assets)
 
         // Load labels
         try {
@@ -227,16 +226,26 @@ class CamActivity : AppCompatActivity() {
         val combinedBoxes = mutableListOf<RectF>()
         val combinedLabels = mutableListOf<String>()
 
+        Log.d(TAG, "ensembleDetections - det1: ${det1.size}, det2: ${det2.size}")
+        Log.d(TAG, "Available labels: $labels")
+        Log.d(TAG, "Requested parts: $requestedParts")
+
         for (part in requestedParts) {
             val indicesForPart = labels.mapIndexedNotNull { idx, lbl -> if (lbl.endsWith("_$part")) idx else null }
+            Log.d(TAG, "Part '$part' indices: $indicesForPart")
             val candidates = det1.filter { it.cls in indicesForPart } + det2.filter { it.cls in indicesForPart }
+            Log.d(TAG, "Candidates for '$part': ${candidates.size}")
             val best = candidates.maxByOrNull { it.score }
             if (best != null) {
                 combinedBoxes.add(best.box)
                 val labelName = if (best.cls < labels.size) labels[best.cls] else "Class ${best.cls}"
                 combinedLabels.add("$labelName ${(best.score * 100).toInt()}%")
+                Log.d(TAG, "Added detection: $labelName with score ${best.score}")
+            } else {
+                Log.d(TAG, "No detection for part: $part")
             }
         }
+        Log.d(TAG, "Final ensemble result - boxes: ${combinedBoxes.size}, labels: $combinedLabels")
         return Pair(combinedBoxes, combinedLabels)
     }
 
@@ -255,19 +264,12 @@ class CamActivity : AppCompatActivity() {
                         val bmp = imageProxyToBitmap(imageProxy)
                         if (bmp != null) {
                             val (boxes, labelsOut) = detectWithBothModels(bmp)
-                            if (boxes.isNotEmpty()) {
-                                runOnUiThread {
-                                    overlayView.setResults(boxes, labelsOut, bmp.width, bmp.height, null)
-                                    val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
-
-                                    if (labelsOut.isNotEmpty()) {
-                                        tvPrediction.text = "Detected: ${labelsOut.joinToString(", ")}\nShelf-Life: $predictedShelfLife"
-                                        tvPrediction.setTextColor(Color.YELLOW)
-                                    } else {
-                                        tvPrediction.text = "No detection"
-                                        tvPrediction.setTextColor(Color.RED)
-                                    }
-                                }
+                            Log.d(TAG, "Camera detection - boxes: ${boxes.size}, labels: $labelsOut")
+                            runOnUiThread {
+                                overlayView.setResults(boxes, labelsOut, bmp.width, bmp.height, null)
+                                val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
+                                tvPrediction.text = "Shelf-life prediction: $predictedShelfLife"
+                                tvPrediction.setTextColor(Color.BLACK)
                             }
                         }
                         imageProxy.close()
@@ -327,5 +329,6 @@ class CamActivity : AppCompatActivity() {
         reqExecutor.shutdown()
         interpreterBest?.close()
         interpreterLast?.close()
+        ShelfLifePredictor.close()
     }
 }
