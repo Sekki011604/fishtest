@@ -12,6 +12,7 @@ import android.widget.Button
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -48,13 +49,24 @@ class CamActivity : AppCompatActivity() {
     private val reqExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val requestedParts = listOf("eye", "caudal_fin", "pectoral_fin", "skin_texture")
 
+    // CameraX state
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var hasShownLiveResult: Boolean = false
+
     // ------------------ IMAGE PICKER ------------------
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
         if (res.resultCode == Activity.RESULT_OK && res.data != null) {
             val uri: Uri? = res.data!!.data
             uri?.let {
                 try {
-                    val bitmap = MediaStore.Images.Media.getBitmap(contentResolver, uri)
+                    // Use a robust decoder that works with more URI types (cloud, documents, large images, etc.)
+                    val bitmap = loadBitmapFromUri(uri)
+                    if (bitmap == null) {
+                        Log.e(TAG, "Failed to decode selected image")
+                        tvPrediction.text = "Unable to load selected image"
+                        return@let
+                    }
+
                     imgUploaded.setImageBitmap(bitmap)
                     imgUploaded.visibility = ImageView.VISIBLE
                     previewView.visibility = PreviewView.GONE
@@ -64,12 +76,26 @@ class CamActivity : AppCompatActivity() {
                         reqExecutor.execute {
                             val (boxes, labelsOut) = detectWithBothModels(bitmap)
                             Log.d(TAG, "Gallery detection - boxes: ${boxes.size}, labels: $labelsOut")
+                            val labelColors = computeLabelColors(bitmap, boxes)
                             runOnUiThread {
-                                overlayView.setResults(boxes, labelsOut, bitmap.width, bitmap.height, dispRect)
-                                
-                                val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
-                                tvPrediction.text = "Shelf-life prediction: $predictedShelfLife"
-                                tvPrediction.setTextColor(Color.BLACK)
+                                if (labelsOut.isNotEmpty()) {
+                                    // Show detections normally
+                                    overlayView.setResults(boxes, labelsOut, bitmap.width, bitmap.height, dispRect, labelColors)
+
+                                    val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
+                                    val partsDetected = labelsOut.size
+                                    val note = if (partsDetected < requestedParts.size) {
+                                        "\nNote: Some fish parts were not detected, so this prediction may be less accurate."
+                                    } else {
+                                        ""
+                                    }
+                                    tvPrediction.text = "Shelf-life prediction: $predictedShelfLife$note"
+                                    tvPrediction.setTextColor(Color.BLACK)
+                                } else {
+                                    // No parts detected: clear overlay and text
+                                    overlayView.setResults(emptyList(), emptyList(), bitmap.width, bitmap.height, dispRect, emptyList())
+                                    tvPrediction.text = ""
+                                }
                             }
                         }
                     }
@@ -90,6 +116,11 @@ class CamActivity : AppCompatActivity() {
         tvPrediction = findViewById(R.id.tvPrediction)
         btnUpload = findViewById(R.id.btnUpload)
         btnScan = findViewById(R.id.btnScan)
+
+        // Ensure the camera preview preserves the same aspect ratio as the
+        // analyzed bitmap (no center-crop). This keeps bounding boxes aligned
+        // with the actual fish parts instead of being shifted into the background.
+        previewView.scaleType = PreviewView.ScaleType.FIT_CENTER
 
         btnUpload.setOnClickListener {
             val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
@@ -119,7 +150,8 @@ class CamActivity : AppCompatActivity() {
 
         // Load models
         try {
-            interpreterBest = Interpreter(loadModelFile("best_float32.tflite"))
+            // Use the int8-quantized "best" model as requested; keep "last" as-is.
+            interpreterBest = Interpreter(loadModelFile("best_int8.tflite"))
             interpreterLast = Interpreter(loadModelFile("last_float32.tflite"))
             tvPrediction.text = "Models loaded"
         } catch (e: Exception) {
@@ -131,6 +163,47 @@ class CamActivity : AppCompatActivity() {
     }
 
     // ------------------ UTILS ------------------
+    /**
+     * Robustly load a bitmap from a content URI, downscaling large images so they fit in memory.
+     * This avoids issues with some gallery / cloud providers that `MediaStore.Images.Media.getBitmap` cannot handle.
+     */
+    private fun loadBitmapFromUri(uri: Uri, maxDim: Int = 2048): Bitmap? {
+        return try {
+            // First decode only bounds to compute an inSampleSize
+            val boundsOptions = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            contentResolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, boundsOptions)
+            }
+
+            val origW = boundsOptions.outWidth
+            val origH = boundsOptions.outHeight
+            if (origW <= 0 || origH <= 0) {
+                Log.e(TAG, "Invalid image bounds for uri=$uri (w=$origW, h=$origH)")
+                return null
+            }
+
+            var sampleSize = 1
+            val largestDim = kotlin.math.max(origW, origH)
+            while (largestDim / sampleSize > maxDim) {
+                sampleSize *= 2
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+
+            contentResolver.openInputStream(uri)?.use { input ->
+                BitmapFactory.decodeStream(input, null, decodeOptions)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "loadBitmapFromUri error for uri=$uri", e)
+            null
+        }
+    }
+
     private fun computeImageViewDisplayRect(iv: ImageView, bmp: Bitmap): RectF {
         val vw = iv.width.toFloat()
         val vh = iv.height.toFloat()
@@ -164,6 +237,92 @@ class CamActivity : AppCompatActivity() {
 
     private data class RawDet(val box: RectF, val cls: Int, val score: Float)
 
+    // Simple class-wise Non-Maximum Suppression to reduce duplicate boxes.
+    // Keeps high-score boxes and removes others that highly overlap with them.
+    private fun nmsPerPart(dets: List<RawDet>, iouThresh: Float = 0.5f): List<RawDet> {
+        if (dets.isEmpty()) return dets
+        val sorted = dets.sortedByDescending { it.score }.toMutableList()
+        val kept = mutableListOf<RawDet>()
+
+        while (sorted.isNotEmpty()) {
+            val best = sorted.removeAt(0)
+            kept.add(best)
+
+            val it = sorted.iterator()
+            while (it.hasNext()) {
+                val other = it.next()
+                val iou = computeIoU(best.box, other.box)
+                if (iou > iouThresh) {
+                    it.remove()
+                }
+            }
+        }
+        return kept
+    }
+
+    private fun computeIoU(a: RectF, b: RectF): Float {
+        val interLeft = max(a.left, b.left)
+        val interTop = max(a.top, b.top)
+        val interRight = min(a.right, b.right)
+        val interBottom = min(a.bottom, b.bottom)
+
+        val interW = max(0f, interRight - interLeft)
+        val interH = max(0f, interBottom - interTop)
+        val interArea = interW * interH
+        if (interArea <= 0f) return 0f
+
+        val areaA = (a.right - a.left) * (a.bottom - a.top)
+        val areaB = (b.right - b.left) * (b.bottom - b.top)
+        val union = areaA + areaB - interArea
+        if (union <= 0f) return 0f
+        return interArea / union
+    }
+
+    /**
+     * Compute adaptive text colors for each detection box based on the brightness
+     * of the area where the label text will be drawn.
+     * Dark background -> white text, light background -> black text.
+     */
+    private fun computeLabelColors(bitmap: Bitmap, boxes: List<RectF>): List<Int> {
+        val result = mutableListOf<Int>()
+        if (boxes.isEmpty()) return result
+
+        val sampleWidth = 32
+        val sampleHeight = 16
+
+        for (box in boxes) {
+            // Sample near the top-left of the box where the text is drawn
+            val startX = box.left.toInt().coerceIn(0, bitmap.width - 1)
+            val startY = (box.top - 10f).toInt().coerceIn(0, bitmap.height - 1)
+
+            var sumLuma = 0f
+            var count = 0
+
+            val endX = kotlin.math.min(startX + sampleWidth, bitmap.width)
+            val endY = kotlin.math.min(startY + sampleHeight, bitmap.height)
+
+            for (y in startY until endY) {
+                for (x in startX until endX) {
+                    val c = bitmap.getPixel(x, y)
+                    val r = Color.red(c)
+                    val g = Color.green(c)
+                    val b = Color.blue(c)
+                    // Standard luminance approximation
+                    val luma = 0.299f * r + 0.587f * g + 0.114f * b
+                    sumLuma += luma
+                    count++
+                }
+            }
+
+            val avgLuma = if (count > 0) sumLuma / count else 255f
+            // Threshold at mid-gray (128): darker background -> white text, lighter -> black text
+            val color = if (avgLuma < 128f) Color.WHITE else Color.BLACK
+            result.add(color)
+        }
+
+        return result
+    }
+
     // ------------------ DETECTION ------------------
     private fun detectWithBothModels(bitmap: Bitmap): Pair<List<RectF>, List<String>> {
         val detBest = detectWithInterpreter(bitmap, interpreterBest)
@@ -191,7 +350,7 @@ class CamActivity : AppCompatActivity() {
         interp.run(input, output)
 
         val numClasses = 20 - 4
-        val rawDetections = ArrayList<RawDet>(200)
+        val rawDetections = ArrayList<RawDet>(400)
 
         for (i in 0 until 8400) {
             val cx = output[0][0][i] * IMAGE_SIZE
@@ -203,7 +362,9 @@ class CamActivity : AppCompatActivity() {
             val maxIdx = scores.indices.maxByOrNull { scores[it] } ?: -1
             val score = if (maxIdx >= 0) scores[maxIdx] else 0f
 
-            if (score > 0.5f && maxIdx >= 0) {
+            // Single best class per anchor (standard YOLO behaviour). Threshold here is
+            // deliberately low; stricter, per-part thresholds are applied in ensembleDetections.
+            if (score > 0.2f && maxIdx >= 0) {
                 val bx1 = cx - w / 2f
                 val by1 = cy - h / 2f
                 val bx2 = cx + w / 2f
@@ -231,18 +392,40 @@ class CamActivity : AppCompatActivity() {
         Log.d(TAG, "Requested parts: $requestedParts")
 
         for (part in requestedParts) {
-            val indicesForPart = labels.mapIndexedNotNull { idx, lbl -> if (lbl.endsWith("_$part")) idx else null }
-            Log.d(TAG, "Part '$part' indices: $indicesForPart")
-            val candidates = det1.filter { it.cls in indicesForPart } + det2.filter { it.cls in indicesForPart }
-            Log.d(TAG, "Candidates for '$part': ${candidates.size}")
-            val best = candidates.maxByOrNull { it.score }
-            if (best != null) {
-                combinedBoxes.add(best.box)
-                val labelName = if (best.cls < labels.size) labels[best.cls] else "Class ${best.cls}"
-                combinedLabels.add("$labelName ${(best.score * 100).toInt()}%")
-                Log.d(TAG, "Added detection: $labelName with score ${best.score}")
-            } else {
-                Log.d(TAG, "No detection for part: $part")
+            // Part-specific score thresholds.
+            // Raise thresholds so detections are more "sure" and reduce over-acting boxes.
+            val partThreshold = when (part) {
+                "eye" -> 0.3f
+                "skin_texture" -> 0.7f
+                "caudal_fin", "pectoral_fin" -> 0.3f
+                else -> 0.6f
+            }
+
+            // Map model labels to this anatomical part (eye, fin, skin), case-insensitive.
+            val partLower = part.lowercase()
+            val indicesForPart = labels.mapIndexedNotNull { idx, lbl ->
+                val lower = lbl.lowercase()
+                if (lower.endsWith("_$partLower") || lower.contains(partLower)) idx else null
+            }
+            Log.d(TAG, "Part '$part' indices (flexible match): $indicesForPart")
+
+            // Only keep detections for this part whose confidence is above the part-specific threshold
+            val rawCandidates = (det1 + det2)
+                .filter { it.cls in indicesForPart && it.score >= partThreshold }
+            Log.d(TAG, "Raw candidates for '$part' (>= threshold $partThreshold): ${rawCandidates.size}")
+
+            // Apply stricter NMS so overlapping boxes collapse more aggressively.
+            val candidates = nmsPerPart(rawCandidates, iouThresh = 0.4f)
+            Log.d(TAG, "Post-NMS candidates for '$part': ${candidates.size}")
+
+            // Keep only the single strongest box per part by default to avoid
+            // multiple detections "over-acting" on a single fish.
+            val maxPerPart = 1
+            for (det in candidates.sortedByDescending { it.score }.take(maxPerPart)) {
+                combinedBoxes.add(det.box)
+                val labelName = if (det.cls < labels.size) labels[det.cls] else "Class ${det.cls}"
+                combinedLabels.add("$labelName ${(det.score * 100).toInt()}%")
+                Log.d(TAG, "Added detection for part '$part': $labelName with score ${det.score}")
             }
         }
         Log.d(TAG, "Final ensemble result - boxes: ${combinedBoxes.size}, labels: $combinedLabels")
@@ -251,9 +434,11 @@ class CamActivity : AppCompatActivity() {
 
     // ------------------ CAMERAX ------------------
     private fun startCamera() {
+        hasShownLiveResult = false
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val provider = cameraProviderFuture.get()
+            cameraProvider = provider
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
             val analyzer = ImageAnalysis.Builder()
@@ -261,18 +446,54 @@ class CamActivity : AppCompatActivity() {
                 .build()
                 .also {
                     it.setAnalyzer(reqExecutor) { imageProxy ->
-                        val bmp = imageProxyToBitmap(imageProxy)
-                        if (bmp != null) {
-                            val (boxes, labelsOut) = detectWithBothModels(bmp)
-                            Log.d(TAG, "Camera detection - boxes: ${boxes.size}, labels: $labelsOut")
-                            runOnUiThread {
-                                overlayView.setResults(boxes, labelsOut, bmp.width, bmp.height, null)
-                                val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
-                                tvPrediction.text = "Shelf-life prediction: $predictedShelfLife"
-                                tvPrediction.setTextColor(Color.BLACK)
-                            }
+                        // If we've already produced a stable live result, skip further analysis
+                        // so bounding boxes and text stay fixed on the scanned parts.
+                        if (hasShownLiveResult) {
+                            imageProxy.close()
+                            return@setAnalyzer
                         }
-                        imageProxy.close()
+                        try {
+                            val bmp = imageProxyToBitmap(imageProxy)
+                            if (bmp != null) {
+                                val (boxes, labelsOut) = detectWithBothModels(bmp)
+                                Log.d(TAG, "Camera detection - boxes: ${boxes.size}, labels: $labelsOut")
+                                val labelColors = computeLabelColors(bmp, boxes)
+                                runOnUiThread {
+                                    try {
+                                        if (labelsOut.isNotEmpty()) {
+                                            // Update overlay normally when we have detections
+                                            overlayView.setResults(boxes, labelsOut, bmp.width, bmp.height, null, labelColors)
+
+                                            // Once we have at least one detected part, "lock in" the result:
+                                            // freeze further analysis, keep the current boxes/text,
+                                            // and also pop out a dialog with the same description.
+                                            val predictedShelfLife = ShelfLifePredictor.predictShelfLife(labelsOut)
+                                            val partsDetected = labelsOut.size
+                                            val note = if (partsDetected < requestedParts.size) {
+                                                "\nNote: Some fish parts were not detected, so this prediction may be less accurate."
+                                            } else {
+                                                ""
+                                            }
+                                            val message = "Shelf-life prediction: $predictedShelfLife$note"
+                                            tvPrediction.text = message
+                                            tvPrediction.setTextColor(Color.BLACK)
+                                            showResultDialog(message)
+                                            hasShownLiveResult = true
+                                        } else {
+                                            // No parts detected: clear overlay and text
+                                            overlayView.setResults(emptyList(), emptyList(), bmp.width, bmp.height, null, emptyList())
+                                            tvPrediction.text = ""
+                                        }
+                                    } catch (uiEx: Exception) {
+                                        Log.e(TAG, "UI update error in analyzer", uiEx)
+                                    }
+                                }
+                            }
+                        } catch (ex: Exception) {
+                            Log.e(TAG, "Analyzer error", ex)
+                        } finally {
+                            imageProxy.close()
+                        }
                     }
                 }
 
@@ -311,6 +532,14 @@ class CamActivity : AppCompatActivity() {
         }
     }
 
+    private fun stopCamera() {
+        try {
+            cameraProvider?.unbindAll()
+        } catch (e: Exception) {
+            Log.e(TAG, "stopCamera error", e)
+        }
+    }
+
     // ------------------ ASSET LOADERS ------------------
     private fun loadModelFile(name: String): MappedByteBuffer {
         val fd = assets.openFd(name)
@@ -324,8 +553,28 @@ class CamActivity : AppCompatActivity() {
         return out
     }
 
+    private fun showResultDialog(predictedShelfLife: String) {
+        // Activity might already be finishing or destroyed; avoid WindowManager crash.
+        if (isFinishing || isDestroyed) return
+
+        AlertDialog.Builder(this)
+            .setTitle("Shelf-life prediction")
+            .setMessage(predictedShelfLife)
+            .setCancelable(false)
+            .setPositiveButton("OK") { dialog, _ ->
+                dialog.dismiss()
+                // Clear previous bounding boxes and text, and resume live scanning
+                // for the next fish.
+                overlayView.setResults(emptyList(), emptyList(), 1, 1, null, emptyList())
+                tvPrediction.text = ""
+                hasShownLiveResult = false
+            }
+            .show()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        stopCamera()
         reqExecutor.shutdown()
         interpreterBest?.close()
         interpreterLast?.close()
